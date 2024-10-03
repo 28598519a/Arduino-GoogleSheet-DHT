@@ -30,14 +30,14 @@ const int httpsPort = 443;
 HTTPSRedirect* client;
 
 //======WebSever setting=======================================
-String webPage;
 String Inssid = "",Inpassword = "";
 IPAddress local_ip(192,168,1,1);
 IPAddress gateway(192,168,1,1);
 IPAddress subnet(255,255,255,0);
 
 ESP8266WebServer server(80);
-int State = 2;
+int State = 1;
+bool ManualReconnect = false;
 // 建立html頁面
 const char htmlPage[]PROGMEM=R"=====(
 <!DOCTYPE html>
@@ -56,32 +56,39 @@ const char htmlPage[]PROGMEM=R"=====(
 )=====";
 
 /////////////////////===connect===////////////////////////////
-void WiFiConnect()
+bool WiFiConnect()
 {
     int i = 0;
+    bool status = false;
+    
     Serial.print("Connecting to wifi: ");
     Serial.println(Inssid);
     WiFi.begin(Inssid.c_str(), Inpassword.c_str());
     
-    while (WiFi.status() != WL_CONNECTED)
+    while (WiFi.status() != WL_CONNECTED && i < 20)
     {
         // 每0.5秒確認一次，10秒未連線成功則退出
         delay(500);
         Serial.print(".");
         i++;
-        if(i == 20) break;
     }
     Serial.println(WiFi.status());
     
     if(i < 20)
     {
+        // 設定斷線自動重連
+        WiFi.setAutoReconnect(true);
+        ManualReconnect = false;
+        
         Serial.println("");
         Serial.println("WiFi connected");
         Serial.print("IP address: ");
         Serial.println(WiFi.localIP());
-        State = 1;
+        status = true;
     }
     yield();
+    
+    return status;
 }
 
 bool CreateClient()
@@ -118,6 +125,8 @@ void softap_start()
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(Fssid, Fpassword);
     WiFi.softAPConfig(local_ip, gateway, subnet);
+    
+    // handlePostForm僅會在外部裝置連上此AP並且在每次與 http://local_ip/ 頁面有交互時才會執行1次
     server.on("/", handlePostForm);
     server.begin();
     Serial.println("HTTP Server Started");
@@ -127,7 +136,6 @@ void softap_start()
 // 取得網頁傳送資料
 void handlePostForm()
 {
-    webPage = htmlPage;
     Inssid = "";
     Inpassword = "";
     Inssid = server.arg("Wifissid");
@@ -135,13 +143,16 @@ void handlePostForm()
 
     if (Inssid != "")
     {
-        Serial.println("Text Received, contents:");
+        Serial.println("SSID Received, contents:");
         Serial.println(Inssid);
-        Serial.println("Text Received, contents:");
+        Serial.println("Passwd Received, contents:");
         Serial.println(Inpassword);
-        State = 1;
+        
+        // 斷開WiFi連線 (自動重連也會關閉)，並清除之前連線的SSID
+        WiFi.disconnect();        
+        ManualReconnect = true;
     }
-    server.send(200,"text/html",webPage);
+    server.send(200,"text/html",htmlPage);
     yield();
 }
 
@@ -252,9 +263,9 @@ void setup()
     WiFiConnect();
     if (WiFi.isConnected())
     {
-        State = 2;
         CreateClient();
     }
+    else ManualReconnect = true;
     
     dht.begin();
     // DHT供電改由I/O腳(0V,5V)，避免DHT因長期通電發熱、損耗
@@ -270,43 +281,39 @@ void loop()
     if (State == 0)
     {
         // 未建立連線時維持網頁
-        Serial.println("WebPage...handling");
+        //Serial.println("WebPage...handling");
         server.handleClient();
-        delay(500);
-        WiFiConnect();
-    }
-    else if (State == 1)
-    {
-        // 收到WIFI資訊後改變esp狀態建立連線
-        // WiFi連線成功，關閉AP及server
-        server.stop();
-        WiFi.softAPdisconnect(true);
-        WiFi.mode(WIFI_STA);
         
         if (WiFi.isConnected())
         {
+            Serial.println(WiFi.status());
+            
+            // WiFi連線成功，關閉AP及server
+            server.stop();
+            WiFi.softAPdisconnect(true);
+            WiFi.mode(WIFI_STA);
+            
             CreateClient();
+            State = 1;
         }
-        
-        State++;
+        else if (ManualReconnect)
+        {
+            // Server跟AP此時比起之前自動重連期間會比較卡一點，因為要delay跟佔住CPU執行緒
+            delay(500);
+            WiFiConnect();
+        }
     }
-    else if (State == 2 && !WiFi.isConnected())
+    else if (State == 1 && !WiFi.isConnected())
     {
         // WiFi狀態斷線，啟動AP並嘗試重連WiFi
         delete client;
-        //WiFi.disconnect();
         Serial.println("connection failed!");
         softap_start();
         
         delay(500);
         State = 0;
     }
-    
-    //Serial.println(CheckFreeRam());
-    yield();
-    
-    /* Ticker */
-    if (TSS_flag && WiFi.isConnected())
+    else if (TSS_flag)
     {
         if (!client->connected())
         {
@@ -315,7 +322,7 @@ void loop()
         
         if (!SensorSend())
         {
-            // Retry, 57 + 2 (DHT) + 1 (Web) = 60s
+            // Retry, 57 + 2 (DHT) + 1 (Web) = 60s. (Need check the client)
             timer2.once(57, TimerSensorSend, false);
         }
         TSS_flag = false;
