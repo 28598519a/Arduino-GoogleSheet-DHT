@@ -10,6 +10,10 @@ Ticker timer1, timer2;
 #define DHTPIN 5
 #define DHTTYPE DHT22
 
+// ESP8266 LED define
+#define LED_BUILTIN 2
+bool setup_states_check = false;
+
 //======WiFi AP setting========================================
 const char Fssid[] = "WeMos D1";       // Ap mode SSID
 const char Fpassword[] = "12345678";   // AP mode Password
@@ -27,7 +31,7 @@ const char host[] = "script.google.com";
 const char GScriptId[] = ""; // Google script ID
 const char DeviceID[] = "";
 const int httpsPort = 443;
-HTTPSRedirect* client;
+HTTPSRedirect* client = nullptr;
 
 //======WebSever setting=======================================
 String Inssid = "",Inpassword = "";
@@ -37,7 +41,7 @@ IPAddress subnet(255,255,255,0);
 
 ESP8266WebServer server(80);
 int State = 1;
-bool ManualReconnect = false;
+bool wifiReconfig = false;
 // 建立html頁面
 const char htmlPage[]PROGMEM=R"=====(
 <!DOCTYPE html>
@@ -64,6 +68,8 @@ bool WiFiConnect()
     Serial.print("Connecting to wifi: ");
     Serial.println(Inssid);
     WiFi.begin(Inssid.c_str(), Inpassword.c_str());
+    // 設定斷線自動重連
+    WiFi.setAutoReconnect(true);
     
     while (WiFi.status() != WL_CONNECTED && i < 20)
     {
@@ -76,10 +82,6 @@ bool WiFiConnect()
     
     if(i < 20)
     {
-        // 設定斷線自動重連
-        WiFi.setAutoReconnect(true);
-        ManualReconnect = false;
-        
         Serial.println("");
         Serial.println("WiFi connected");
         Serial.print("IP address: ");
@@ -93,6 +95,12 @@ bool WiFiConnect()
 
 bool CreateClient()
 {
+    if (client != nullptr)
+    {
+        delete client;
+        client = nullptr;
+    }
+    
     client = new HTTPSRedirect(httpsPort);
     client->setPrintResponseBody(true);
     client->setContentTypeHeader("application/json");
@@ -125,12 +133,11 @@ void softap_start()
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(Fssid, Fpassword);
     WiFi.softAPConfig(local_ip, gateway, subnet);
+    Serial.println("WiFi not connected, start HTTP Server");
     
     // handlePostForm僅會在外部裝置連上此AP並且在每次與 http://local_ip/ 頁面有交互時才會執行1次
     server.on("/", handlePostForm);
     server.begin();
-    Serial.println("HTTP Server Started");
-    yield();
 }
 
 // 取得網頁傳送資料
@@ -149,8 +156,8 @@ void handlePostForm()
         Serial.println(Inpassword);
         
         // 斷開WiFi連線 (自動重連也會關閉)，並清除之前連線的SSID
-        WiFi.disconnect();        
-        ManualReconnect = true;
+        WiFi.disconnect();
+        wifiReconfig = true;
     }
     server.send(200,"text/html",htmlPage);
     yield();
@@ -238,7 +245,7 @@ bool SensorSend()
 // 預設0秒先觸發做1次
 bool TSS_flag = true;
 
-void TimerSensorSend(bool main_ticker=false)
+void TimerSensorSend(bool main_ticker)
 {
     // 當timer1 (正常的送資料時間) 觸發時若timer2還在運作就關掉timer2
     if (main_ticker && timer2.active())
@@ -253,19 +260,20 @@ void TimerSensorSend(bool main_ticker=false)
 
 void setup()
 {
+    // LED ON (low active)
+    if (setup_states_check) { pinMode(LED_BUILTIN, OUTPUT); }
+    
     Serial.begin(115200);
     Serial.println();
     Inssid = ssid;
     Inpassword = password;
     
+    // Wait ESP8266 firmware ready
+    delay(1000);
+    
     // Station, 無AP
     WiFi.mode(WIFI_STA);
     WiFiConnect();
-    if (WiFi.isConnected())
-    {
-        CreateClient();
-    }
-    else ManualReconnect = true;
     
     dht.begin();
     // DHT供電改由I/O腳(0V,5V)，避免DHT因長期通電發熱、損耗
@@ -273,6 +281,9 @@ void setup()
     
     // 每1小時收集並上傳1次感測數據 (不包含0秒，這裡透過TSS_flag預設值來達成)
     timer1.attach(3600, TimerSensorSend, true);
+    
+    // setup() finished, LED OFF
+    if (setup_states_check) { digitalWrite(LED_BUILTIN, HIGH); }
 }
 
 void loop()
@@ -284,7 +295,14 @@ void loop()
         //Serial.println("WebPage...handling");
         server.handleClient();
         
-        if (WiFi.isConnected())
+        // 有在server內設定新WiFi時，手動嘗試連線
+        if (wifiReconfig)
+        {
+            wifiReconfig = false;
+            WiFiConnect();
+        }
+        
+        if (WiFi.isConnected() && WiFi.status() == WL_CONNECTED && WiFi.localIP()[0] != 0)
         {
             Serial.println(WiFi.status());
             
@@ -292,39 +310,44 @@ void loop()
             server.stop();
             WiFi.softAPdisconnect(true);
             WiFi.mode(WIFI_STA);
-            
-            CreateClient();
             State = 1;
-        }
-        else if (ManualReconnect)
-        {
-            // Server跟AP此時比起之前自動重連期間會比較卡一點，因為要delay跟佔住CPU執行緒
-            delay(500);
-            WiFiConnect();
         }
     }
     else if (State == 1 && !WiFi.isConnected())
     {
         // WiFi狀態斷線，啟動AP並嘗試重連WiFi
-        delete client;
-        Serial.println("connection failed!");
+        Serial.println("No WiFi connection, AP start");
+        
+        if (client != nullptr)
+        {
+            delete client;
+            client = nullptr;
+        }
         softap_start();
         
         delay(500);
         State = 0;
     }
-    else if (TSS_flag)
+    else if (TSS_flag && WiFi.isConnected())
     {
-        if (!client->connected())
+        if (client == nullptr)
+        {
+            CreateClient();
+        }
+        else if (!client->connected())
         {
             ClientConnect();
         }
         
-        if (!SensorSend())
+        if (client != nullptr)
         {
-            // Retry, 57 + 2 (DHT) + 1 (Web) = 60s. (Need check the client)
-            timer2.once(57, TimerSensorSend, false);
+            if (!SensorSend() && !timer2.active())
+            {
+                // Retry, 57 + 2 (DHT) + 1 (Web) = 60s. (Need check the client)
+                timer2.once(57, TimerSensorSend, false);
+            }
         }
+        
         TSS_flag = false;
     }
     
